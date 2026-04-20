@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# macOS
+.DS_Store
+
+# PDFs and output folders
+*.pdf
+marked/
+errors/
+pdf/
+
+# PyInstaller
+build/
+dist/
+*.spec
+
+# Claude
+.claude/
