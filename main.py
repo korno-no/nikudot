@@ -7,6 +7,19 @@ import pdfplumber
 
 DAYS = ["ראשון", "שני", "שלישי", "רביעי", "חמישי", "שישי", "שבת"]
 REVERSED_TO_DAY = {day[::-1]: day for day in DAYS}
+
+# International worker PDFs use English abbreviations with Hebrew ordinal letter
+ENG_TO_DAY = {
+    "Sun-א": "ראשון",
+    "Mon-ב": "שני",
+    "Tue-ג": "שלישי",
+    "Wed-ד": "רביעי",
+    "Thu-ה": "חמישי",
+    "Fri-ו": "שישי",
+    "Sat-ש": "שבת",
+}
+
+CELL_TO_DAY = {**REVERSED_TO_DAY, **ENG_TO_DAY}
 TIME_PATTERN = re.compile(r"\d{1,2}:\d{2}")
 
 COL_PATIENT_SIG = 0
@@ -38,20 +51,20 @@ def extract_schedule(tables: list) -> dict:
         header_row = None
         for row in table:
             clean = [cell.strip() if cell else "" for cell in row]
-            if any(token in REVERSED_TO_DAY for token in clean):
+            if any(token in CELL_TO_DAY for token in clean):
                 header_row = clean
                 break
         if header_row is None:
             continue
 
         col_to_day = {
-            col: REVERSED_TO_DAY[cell]
+            col: CELL_TO_DAY[cell]
             for col, cell in enumerate(header_row)
-            if cell in REVERSED_TO_DAY
+            if cell in CELL_TO_DAY
         }
         header_idx = next(
             i for i, row in enumerate(table)
-            if any((cell or "").strip() in REVERSED_TO_DAY for cell in row)
+            if any((cell or "").strip() in CELL_TO_DAY for cell in row)
         )
         time_row = table[header_idx + 1] if header_idx + 1 < len(table) else []
 
@@ -74,7 +87,7 @@ class RowInfo:
     group_id: int
 
 
-def classify_rows(table_obj, table_data: list, schedule: dict) -> list[RowInfo]:
+def classify_rows(table_obj, table_data: list, schedule: dict, first_day: int = 1) -> list[RowInfo]:
     rows: list[RowInfo] = []
     group_id = -1
 
@@ -82,7 +95,10 @@ def classify_rows(table_obj, table_data: list, schedule: dict) -> list[RowInfo]:
         row_data = table_data[row_idx]
         if len(row_data) <= COL_DAY_NAME:
             continue
-        if not (row_data[9] or "").strip().isdigit():
+        day_num_str = (row_data[9] or "").strip()
+        if not day_num_str.isdigit():
+            continue
+        if int(day_num_str) < first_day:
             continue
 
         row_obj = table_obj.rows[row_idx] if row_idx < len(table_obj.rows) else None
@@ -95,7 +111,7 @@ def classify_rows(table_obj, table_data: list, schedule: dict) -> list[RowInfo]:
                 patient_bbox = row_obj.cells[COL_PATIENT_SIG]
 
         day_raw = (row_data[COL_DAY_NAME] or "").strip()
-        day_name = REVERSED_TO_DAY.get(day_raw)
+        day_name = CELL_TO_DAY.get(day_raw)
         hol = is_holiday(row_data[COL_HOL] if COL_HOL < len(row_data) else None)
         working = bool(day_name and schedule.get(day_name, {}).get("working"))
 
@@ -134,7 +150,7 @@ def plan_marks(rows: list[RowInfo]) -> list[tuple[tuple, str]]:
             if row.is_working:
                 slot = next(free_iter, None)
                 if slot:
-                    marks.append((slot, "dot"))
+                    marks.append((slot, "asterisk"))
                     dot_bboxes.add(slot)
         elif row.is_working:
             marks.append((row.worker_bbox, "dot"))
@@ -166,6 +182,15 @@ def draw_marks(fitz_page: fitz.Page, marks: list[tuple[tuple, str]]) -> None:
                 fitz.Point(cx, cy), DOT_RADIUS, color=BLACK, fill=BLACK
             )
 
+        elif kind == "asterisk":
+            cx = x1 - DOT_RADIUS - 2
+            fitz_page.insert_text(
+                fitz.Point(cx - 4, cy + 4),
+                "*",
+                fontsize=12,
+                color=BLACK,
+            )
+
         elif kind == "dash":
             pad = 6
             fitz_page.draw_line(
@@ -177,7 +202,7 @@ def draw_marks(fitz_page: fitz.Page, marks: list[tuple[tuple, str]]) -> None:
 
         elif kind == "circle_x":
             r = CIRCLE_X_RADIUS
-            cx = x1 - r - 3
+            cx = (x0 + x1) / 2 + (x1 - x0) * 0.3
             fitz_page.draw_circle(fitz.Point(cx, cy), r, color=BLACK, width=0.8)
             off = r * 0.6
             fitz_page.draw_line(
@@ -188,6 +213,33 @@ def draw_marks(fitz_page: fitz.Page, marks: list[tuple[tuple, str]]) -> None:
                 fitz.Point(cx - off, cy + off), fitz.Point(cx + off, cy - off),
                 color=BLACK, width=0.8,
             )
+
+
+def get_report_month(page) -> tuple[int, int]:
+    """Return (month, year) from the 'דו"ח מעקב יומי לחדש: MM/YYYY' header cell."""
+    for table in page.extract_tables():
+        for row in table:
+            for cell in row:
+                if cell and "שדוח" in cell:
+                    m = re.search(r"(\d{2})/(\d{4})", cell)
+                    if m:
+                        return int(m.group(1)), int(m.group(2))
+    return 0, 0
+
+
+def get_start_date(page) -> tuple[int, int, int]:
+    """Return (day, month, year) from the row below the התחלת שיבוץ label."""
+    tables = page.extract_tables()
+    t0 = tables[0] if tables else []
+    for r_idx, row in enumerate(t0):
+        if row and row[0] and "ץוביש תלחתה" in row[0]:
+            if r_idx + 1 < len(t0):
+                val = (t0[r_idx + 1][0] or "").strip()
+                m = re.match(r"(\d{1,2})/(\d{2})/(\d{4})", val)
+                if m:
+                    return int(m.group(1)), int(m.group(2)), int(m.group(3))
+            break
+    return 1, 0, 0
 
 
 def get_family_relation(page) -> str:
@@ -252,16 +304,27 @@ def bottom_table_marks(t_obj, t_data: list, family_is_no: bool) -> list[tuple[tu
     return marks
 
 
-def mark_pdf(pdf_path: str, output_path: str) -> dict:
-    with pdfplumber.open(pdf_path) as pdf:
-        page = pdf.pages[0]
-        table_objects = page.find_tables()
-        table_data_list = page.extract_tables()
+def _process_page(
+    plumber_page, fitz_page: fitz.Page
+) -> dict:
+    table_objects = plumber_page.find_tables()
+    table_data_list = plumber_page.extract_tables()
 
-        family_relation = get_family_relation(page)
+    try:
+        family_relation = get_family_relation(plumber_page)
+    except Exception:
+        family_relation = "לא"
 
     schedule = extract_schedule(table_data_list)
     family_is_no = family_relation == "לא"
+
+    report_mm, report_yyyy = get_report_month(plumber_page)
+    start_dd, start_mm, start_yyyy = get_start_date(plumber_page)
+    first_day = (
+        start_dd
+        if report_yyyy == start_yyyy and report_mm == start_mm
+        else 1
+    )
 
     all_marks: list[tuple[tuple, str]] = []
 
@@ -270,29 +333,42 @@ def mark_pdf(pdf_path: str, output_path: str) -> dict:
             continue
         header = t_data[0]
 
-        # Monthly log table (has the day-of-week column)
         if any("םוי" in (cell or "") for cell in header):
-            rows = classify_rows(t_obj, t_data, schedule)
+            rows = classify_rows(t_obj, t_data, schedule, first_day)
             all_marks.extend(plan_marks(rows))
 
-        # Bottom declaration table (has אישור המטפל/ת header)
         elif any("ת/לפטמה רושיא" in (cell or "") for cell in header):
             all_marks.extend(bottom_table_marks(t_obj, t_data, family_is_no))
 
-    doc = fitz.open(pdf_path)
-    draw_marks(doc[0], all_marks)
-    doc.save(output_path)
+    draw_marks(fitz_page, all_marks)
 
     return {
         "dots": sum(1 for _, k in all_marks if k == "dot"),
+        "asterisks": sum(1 for _, k in all_marks if k == "asterisk"),
         "dashes": sum(1 for _, k in all_marks if k == "dash"),
         "circle_x": sum(1 for _, k in all_marks if k == "circle_x"),
-        "family_relation": family_relation,
     }
 
 
+def mark_pdf(pdf_path: str, output_path: str, progress_cb=None) -> dict:
+    doc = fitz.open(pdf_path)
+    totals = {"dots": 0, "asterisks": 0, "dashes": 0, "circle_x": 0}
+
+    with pdfplumber.open(pdf_path) as pdf:
+        for i, plumber_page in enumerate(pdf.pages):
+            stats = _process_page(plumber_page, doc[i])
+            for k in totals:
+                totals[k] += stats[k]
+            if progress_cb:
+                progress_cb(i + 1, len(pdf.pages))
+
+    doc.save(output_path)
+    return totals
+
+
 if __name__ == "__main__":
-    for pdf_file in ["test1.pdf", "test2.pdf"]:
-        out = pdf_file.replace(".pdf", "_marked.pdf")
-        stats = mark_pdf(pdf_file, out)
-        print(f"{pdf_file} → {out}  {stats}")
+    import sys
+    pdf_file = sys.argv[1] if len(sys.argv) > 1 else "test.pdf"
+    out = pdf_file.replace(".pdf", "_marked.pdf")
+    stats = mark_pdf(pdf_file, out, progress_cb=lambda d, t: print(f"  page {d}/{t}"))
+    print(f"{pdf_file} → {out}  {stats}")
