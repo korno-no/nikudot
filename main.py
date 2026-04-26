@@ -87,7 +87,7 @@ class RowInfo:
     group_id: int
 
 
-def classify_rows(table_obj, table_data: list, schedule: dict, first_day: int = 1) -> list[RowInfo]:
+def classify_rows(table_obj, table_data: list, schedule: dict, first_day: int = 1, last_day: int = 31) -> list[RowInfo]:
     rows: list[RowInfo] = []
     group_id = -1
 
@@ -98,7 +98,8 @@ def classify_rows(table_obj, table_data: list, schedule: dict, first_day: int = 
         day_num_str = (row_data[9] or "").strip()
         if not day_num_str.isdigit():
             continue
-        if int(day_num_str) < first_day:
+        day_num = int(day_num_str)
+        if day_num < first_day or day_num > last_day:
             continue
 
         row_obj = table_obj.rows[row_idx] if row_idx < len(table_obj.rows) else None
@@ -242,6 +243,21 @@ def get_start_date(page) -> tuple[int, int, int]:
     return 1, 0, 0
 
 
+def get_end_date(page) -> tuple[int, int, int] | None:
+    """Return (day, month, year) from the row below the סיום שיבוץ label, or None if absent."""
+    tables = page.extract_tables()
+    t0 = tables[0] if tables else []
+    for r_idx, row in enumerate(t0):
+        if row and row[0] and "ץוביש םויס" in row[0]:
+            if r_idx + 1 < len(t0):
+                val = (t0[r_idx + 1][0] or "").strip()
+                m = re.match(r"(\d{1,2})/(\d{2})/(\d{4})", val)
+                if m:
+                    return int(m.group(1)), int(m.group(2)), int(m.group(3))
+            break
+    return None
+
+
 def get_family_relation(page) -> str:
     """Return 'לא' or 'כן' by reading the value below the קרוב משפחה label."""
     t0_obj = page.find_tables()[0]
@@ -319,11 +335,19 @@ def _process_page(
     family_is_no = family_relation == "לא"
 
     report_mm, report_yyyy = get_report_month(plumber_page)
+
     start_dd, start_mm, start_yyyy = get_start_date(plumber_page)
     first_day = (
         start_dd
         if report_yyyy == start_yyyy and report_mm == start_mm
         else 1
+    )
+
+    end = get_end_date(plumber_page)
+    last_day = (
+        end[0]
+        if end and report_yyyy == end[2] and report_mm == end[1]
+        else 31
     )
 
     all_marks: list[tuple[tuple, str]] = []
@@ -334,7 +358,7 @@ def _process_page(
         header = t_data[0]
 
         if any("םוי" in (cell or "") for cell in header):
-            rows = classify_rows(t_obj, t_data, schedule, first_day)
+            rows = classify_rows(t_obj, t_data, schedule, first_day, last_day)
             all_marks.extend(plan_marks(rows))
 
         elif any("ת/לפטמה רושיא" in (cell or "") for cell in header):
